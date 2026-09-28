@@ -1,0 +1,59 @@
+name: Build Kavi Wallet APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Unzip project if uploaded as a zip
+        run: |
+          if [ -z "$(find . -name settings.gradle -not -path './.git/*' | head -n 1)" ]; then
+            Z=$(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -n "$Z" ]; then
+              echo "Unzipping $Z"
+              mkdir -p _project && unzip -q -o "$Z" -d _project
+            fi
+          fi
+
+      - name: Find project folder
+        id: proj
+        run: |
+          F=$(find . -name settings.gradle -not -path './.git/*' | head -n 1)
+          if [ -z "$F" ]; then
+            echo "::error::settings.gradle was not found. These files are in the repository:"
+            find . -maxdepth 4 -not -path './.git*' | head -n 100
+            exit 1
+          fi
+          D=$(dirname "$F")
+          for need in app/build.gradle app/src/main/AndroidManifest.xml app/src/main/assets/www/index.html app/src/main/java/app/kaviwallet/MainActivity.java; do
+            if [ ! -f "$D/$need" ]; then echo "::error::Missing file: $need (upload it too)"; exit 1; fi
+          done
+          echo "dir=$D" >> "$GITHUB_OUTPUT"
+          echo "Project folder: $D"
+
+      - name: Build APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KaviWallet-apk
+          path: '**/app/build/outputs/apk/debug/app-debug.apk'
+          if-no-files-found: error
