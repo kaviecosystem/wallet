@@ -23,7 +23,7 @@ jobs:
       - name: Unzip project if uploaded as a zip
         run: |
           if [ -z "$(find . -name settings.gradle -not -path './.git/*' | head -n 1)" ]; then
-            Z=$(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | head -n 1)
+            Z=$(ls -t $(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*') 2>/dev/null | head -n 1)
             if [ -n "$Z" ]; then
               echo "Unzipping $Z"
               mkdir -p _project && unzip -q -o "$Z" -d _project
@@ -46,12 +46,44 @@ jobs:
           echo "dir=$D" >> "$GITHUB_OUTPUT"
           echo "Project folder: $D"
 
-      - name: Build APK
+      - name: Prepare signing key
+        env:
+          KS: ${{ secrets.KAVI_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KS" ]; then
+            echo "::error::Signing secret KAVI_KEYSTORE_BASE64 is missing. Add the 4 KAVI_ secrets in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "$KS" | tr -d ' \n\r' | base64 -d > "$RUNNER_TEMP/kavi-release.jks"
+          echo "KAVI_KEYSTORE_FILE=$RUNNER_TEMP/kavi-release.jks" >> "$GITHUB_ENV"
+
+      - name: Build signed APK
         working-directory: ${{ steps.proj.outputs.dir }}
-        run: gradle assembleDebug --no-daemon --stacktrace
+        env:
+          KAVI_KEYSTORE_PASSWORD: ${{ secrets.KAVI_KEYSTORE_PASSWORD }}
+          KAVI_KEY_ALIAS: ${{ secrets.KAVI_KEY_ALIAS }}
+          KAVI_KEY_PASSWORD: ${{ secrets.KAVI_KEY_PASSWORD }}
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: |
+          A=$(find . -path '*/app/build/outputs/apk/release/*.apk' | head -n 1)
+          cp "$A" KaviWallet.apk
+          ls -la KaviWallet.apk
+
+      - name: Show signing key
+        run: |
+          AS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n 1)apksigner
+          if [ -x "$AS" ]; then
+            SHA=$("$AS" verify --print-certs KaviWallet.apk | grep -m1 'SHA-256' | sed 's/.*: //' | tr 'a-f' 'A-F' | sed 's/../&:/g;s/:$//')
+            echo "Signing key SHA-256: $SHA"
+            echo "### Signing key" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "Kavi Wallet → Me → App signing key must show the same start and end." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: KaviWallet-apk
-          path: '**/app/build/outputs/apk/debug/app-debug.apk'
+          path: KaviWallet.apk
           if-no-files-found: error
