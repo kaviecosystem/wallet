@@ -20,42 +20,80 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Unzip project if uploaded as a zip
-        run: |
-          if [ -z "$(find . -name settings.gradle -not -path './.git/*' | head -n 1)" ]; then
-            Z=$(ls -t $(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*') 2>/dev/null | head -n 1)
-            if [ -n "$Z" ]; then
-              echo "Unzipping $Z"
-              mkdir -p _project && unzip -q -o "$Z" -d _project
-            fi
-          fi
-
-      - name: Find project folder
+      - name: Find the newest Kavi Wallet project
         id: proj
         run: |
-          F=$(find . -name settings.gradle -not -path './.git/*' | head -n 1)
-          if [ -z "$F" ]; then
-            echo "::error::settings.gradle was not found. These files are in the repository:"
-            find . -maxdepth 4 -not -path './.git*' | head -n 100
+          Z=$(ls -t $(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*') 2>/dev/null | head -n 1)
+          if [ -n "$Z" ]; then
+            echo "Using zip: $Z"
+            rm -rf _project && mkdir -p _project && unzip -q -o "$Z" -d _project
+            SEARCH=_project
+          else
+            SEARCH=.
+          fi
+          D=""
+          for f in $(find "$SEARCH" -name settings.gradle -not -path './.git/*'); do
+            d=$(dirname "$f")
+            if grep -q KAVI_KEYSTORE_FILE "$d/app/build.gradle" 2>/dev/null; then D="$d"; break; fi
+          done
+          if [ -z "$D" ]; then
+            echo "::error::Kavi Wallet project not found. Upload KaviWallet-Android.zip (the newest one) to the repository."
+            find . -maxdepth 3 -not -path './.git*' | head -n 60
             exit 1
           fi
-          D=$(dirname "$F")
-          for need in app/build.gradle app/src/main/AndroidManifest.xml app/src/main/assets/www/index.html app/src/main/java/app/kaviwallet/MainActivity.java; do
-            if [ ! -f "$D/$need" ]; then echo "::error::Missing file: $need (upload it too)"; exit 1; fi
+          for need in app/src/main/AndroidManifest.xml app/src/main/assets/www/index.html app/src/main/java/app/kaviwallet/MainActivity.java; do
+            if [ ! -f "$D/$need" ]; then echo "::error::Missing file: $need"; exit 1; fi
           done
+          echo "Version: $(grep -m1 versionName "$D/app/build.gradle")"
           echo "dir=$D" >> "$GITHUB_OUTPUT"
           echo "Project folder: $D"
 
       - name: Prepare signing key
         env:
           KS: ${{ secrets.KAVI_KEYSTORE_BASE64 }}
+          KK: ${{ secrets.KAVI_KEYSTORE_KEY }}
+          SP: ${{ secrets.KAVI_KEYSTORE_PASSWORD }}
+          KA: ${{ secrets.KAVI_KEY_ALIAS }}
+          KP: ${{ secrets.KAVI_KEY_PASSWORD }}
         run: |
-          if [ -z "$KS" ]; then
-            echo "::error::Signing secret KAVI_KEYSTORE_BASE64 is missing. Add the 4 KAVI_ secrets in Settings > Secrets and variables > Actions."
+          D="${{ steps.proj.outputs.dir }}"
+          F="$RUNNER_TEMP/kavi-release.jks"
+          SPT=$(printf '%s' "$SP" | tr -d '\r\n')
+          KAT=$(printf '%s' "$KA" | tr -d '\r\n ')
+          [ -z "$SPT" ] && { echo "::error::Secret KAVI_KEYSTORE_PASSWORD is missing. Value: 1-KAVI_KEYSTORE_PASSWORD.txt"; exit 1; }
+          [ -z "$KAT" ] && { echo "::error::Secret KAVI_KEY_ALIAS is missing. Value: 2-KAVI_KEY_ALIAS.txt"; exit 1; }
+          [ -z "$KP" ] && { echo "::error::Secret KAVI_KEY_PASSWORD is missing. Value: 3-KAVI_KEY_PASSWORD.txt"; exit 1; }
+          ok=""
+          if [ -n "$KS" ]; then
+            printf '%s' "$KS" | tr -d ' \n\r\t' | base64 -d > "$F" 2>/dev/null || true
+            if [ -s "$F" ] && keytool -list -keystore "$F" -storepass "$SPT" >/dev/null 2>&1; then ok="base64"; else echo "KAVI_KEYSTORE_BASE64 is incomplete or wrong, trying KAVI_KEYSTORE_KEY instead."; fi
+          fi
+          if [ -z "$ok" ]; then
+            KKT=$(printf '%s' "$KK" | tr -d '\r\n ')
+            if [ -z "$KKT" ]; then
+              echo "::error::Add the secret KAVI_KEYSTORE_KEY (value: 5-KAVI_KEYSTORE_KEY.txt, 40 characters)."
+              exit 1
+            fi
+            if [ ! -f "$D/signing/kavi-release.jks.enc" ]; then
+              echo "::error::signing/kavi-release.jks.enc is missing. Upload the newest KaviWallet-Android.zip."
+              exit 1
+            fi
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$D/signing/kavi-release.jks.enc" -out "$F" -pass "pass:$KKT" 2>/dev/null; then
+              echo "::error::KAVI_KEYSTORE_KEY is wrong. Copy it again from 5-KAVI_KEYSTORE_KEY.txt (exactly 40 characters)."
+              exit 1
+            fi
+            ok="key"
+          fi
+          if ! keytool -list -keystore "$F" -storepass "$SPT" >/dev/null 2>&1; then
+            echo "::error::KAVI_KEYSTORE_PASSWORD is wrong. Copy it again from 1-KAVI_KEYSTORE_PASSWORD.txt."
             exit 1
           fi
-          echo "$KS" | tr -d ' \n\r' | base64 -d > "$RUNNER_TEMP/kavi-release.jks"
-          echo "KAVI_KEYSTORE_FILE=$RUNNER_TEMP/kavi-release.jks" >> "$GITHUB_ENV"
+          if ! keytool -list -keystore "$F" -storepass "$SPT" -alias "$KAT" >/dev/null 2>&1; then
+            echo "::error::KAVI_KEY_ALIAS is wrong. It must be exactly: the text in 2-KAVI_KEY_ALIAS.txt"
+            exit 1
+          fi
+          echo "Signing key ready (from $ok): $(keytool -list -v -keystore "$F" -storepass "$SPT" -alias "$KAT" | grep -m1 'SHA256:' | sed 's/.*SHA256: //')"
+          echo "KAVI_KEYSTORE_FILE=$F" >> "$GITHUB_ENV"
 
       - name: Build signed APK
         working-directory: ${{ steps.proj.outputs.dir }}
@@ -63,24 +101,34 @@ jobs:
           KAVI_KEYSTORE_PASSWORD: ${{ secrets.KAVI_KEYSTORE_PASSWORD }}
           KAVI_KEY_ALIAS: ${{ secrets.KAVI_KEY_ALIAS }}
           KAVI_KEY_PASSWORD: ${{ secrets.KAVI_KEY_PASSWORD }}
-        run: gradle assembleRelease --no-daemon --stacktrace
-
-      - name: Rename APK
         run: |
-          A=$(find . -path '*/app/build/outputs/apk/release/*.apk' | head -n 1)
+          export KAVI_KEYSTORE_PASSWORD=$(printf '%s' "$KAVI_KEYSTORE_PASSWORD" | tr -d '\r\n')
+          export KAVI_KEY_ALIAS=$(printf '%s' "$KAVI_KEY_ALIAS" | tr -d '\r\n ')
+          export KAVI_KEY_PASSWORD=$(printf '%s' "$KAVI_KEY_PASSWORD" | tr -d '\r\n')
+          gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Check APK signature
+        run: |
+          A=$(find "${{ steps.proj.outputs.dir }}" -path '*/app/build/outputs/apk/release/*.apk' | grep -v unsigned | head -n 1)
+          if [ -z "$A" ]; then
+            echo "::error::No signed APK was produced. Check that KAVI_KEY_PASSWORD matches 3-KAVI_KEY_PASSWORD.txt."
+            find . -name '*.apk'
+            exit 1
+          fi
           cp "$A" KaviWallet.apk
-          ls -la KaviWallet.apk
-
-      - name: Show signing key
-        run: |
           AS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -n 1)apksigner
           if [ -x "$AS" ]; then
+            "$AS" verify KaviWallet.apk || { echo "::error::APK signature is invalid"; exit 1; }
             SHA=$("$AS" verify --print-certs KaviWallet.apk | grep -m1 'SHA-256' | sed 's/.*: //' | tr 'a-f' 'A-F' | sed 's/../&:/g;s/:$//')
-            echo "Signing key SHA-256: $SHA"
-            echo "### Signing key" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "Kavi Wallet → Me → App signing key must show the same start and end." >> "$GITHUB_STEP_SUMMARY"
+            echo "APK signing key SHA-256: $SHA"
+            {
+              echo "### Kavi Wallet APK is ready"
+              echo "Signing key: \`$SHA\`"
+              echo ""
+              echo "In the app, Me > App signing key must show the same start and end (99:90 ... A2:4F)."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
+          ls -la KaviWallet.apk
 
       - uses: actions/upload-artifact@v4
         with:
