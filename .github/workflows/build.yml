@@ -95,6 +95,27 @@ jobs:
           echo "Signing key ready (from $ok): $(keytool -list -v -keystore "$F" -storepass "$SPT" -alias "$KAT" | grep -m1 'SHA256:' | sed 's/.*SHA256: //')"
           echo "KAVI_KEYSTORE_FILE=$F" >> "$GITHUB_ENV"
 
+      - name: Add transaction history key
+        env:
+          NK: ${{ secrets.KAVI_NODEREAL_KEY }}
+        run: |
+          F="${{ steps.proj.outputs.dir }}/app/src/main/assets/www/wallet.js"
+          K=$(printf '%s' "$NK" | tr -d '\r\n ' | sed 's#.*/v1/##; s#/.*##')
+          if [ -z "$K" ]; then
+            echo "No KAVI_NODEREAL_KEY secret: token history will show Kavi Wallet transactions only."
+            exit 0
+          fi
+          if ! printf '%s' "$K" | grep -Eq '^[A-Za-z0-9_-]{16,64}$'; then
+            echo "::error::KAVI_NODEREAL_KEY looks wrong. Paste only the key (the part after /v1/ in the NodeReal link)."
+            exit 1
+          fi
+          if ! grep -q "nodereal:''" "$F"; then
+            echo "::error::Could not find the history key slot in wallet.js. Upload the newest KaviWallet-Android.zip."
+            exit 1
+          fi
+          sed -i "s/nodereal:''/nodereal:'$K'/" "$F"
+          echo "Full transaction history is ON for all users (key ...${K: -4})."
+
       - name: Build signed APK
         working-directory: ${{ steps.proj.outputs.dir }}
         env:
