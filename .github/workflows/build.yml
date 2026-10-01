@@ -5,18 +5,21 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
         with:
           gradle-version: '8.7'
 
@@ -44,21 +47,22 @@ jobs:
           for need in app/src/main/AndroidManifest.xml app/src/main/assets/www/index.html app/src/main/java/app/kaviwallet/MainActivity.java; do
             if [ ! -f "$D/$need" ]; then echo "::error::Missing file: $need"; exit 1; fi
           done
+          if ! printf '%s' "$D" | grep -Eq '^[A-Za-z0-9_./-]+$'; then echo "::error::Unexpected project folder name"; exit 1; fi
           echo "Version: $(grep -m1 versionName "$D/app/build.gradle")"
           echo "dir=$D" >> "$GITHUB_OUTPUT"
           echo "Project folder: $D"
 
       - name: Prepare signing key
         env:
+          D: ${{ steps.proj.outputs.dir }}
           KS: ${{ secrets.KAVI_KEYSTORE_BASE64 }}
           KK: ${{ secrets.KAVI_KEYSTORE_KEY }}
           SP: ${{ secrets.KAVI_KEYSTORE_PASSWORD }}
           KA: ${{ secrets.KAVI_KEY_ALIAS }}
           KP: ${{ secrets.KAVI_KEY_PASSWORD }}
         run: |
-          D="${{ steps.proj.outputs.dir }}"
           F="$RUNNER_TEMP/kavi-release.jks"
-          SPT=$(printf '%s' "$SP" | tr -d '\r\n')
+          SPT=$(printf '%s' "$SP" | tr -d '\r\n'); export SPT
           KAT=$(printf '%s' "$KA" | tr -d '\r\n ')
           [ -z "$SPT" ] && { echo "::error::Secret KAVI_KEYSTORE_PASSWORD is missing. Value: 1-KAVI_KEYSTORE_PASSWORD.txt"; exit 1; }
           [ -z "$KAT" ] && { echo "::error::Secret KAVI_KEY_ALIAS is missing. Value: 2-KAVI_KEY_ALIAS.txt"; exit 1; }
@@ -66,7 +70,7 @@ jobs:
           ok=""
           if [ -n "$KS" ]; then
             printf '%s' "$KS" | tr -d ' \n\r\t' | base64 -d > "$F" 2>/dev/null || true
-            if [ -s "$F" ] && keytool -list -keystore "$F" -storepass "$SPT" >/dev/null 2>&1; then ok="base64"; else echo "KAVI_KEYSTORE_BASE64 is incomplete or wrong, trying KAVI_KEYSTORE_KEY instead."; fi
+            if [ -s "$F" ] && keytool -list -keystore "$F" -storepass:env SPT >/dev/null 2>&1; then ok="base64"; else echo "KAVI_KEYSTORE_BASE64 is incomplete or wrong, trying KAVI_KEYSTORE_KEY instead."; fi
           fi
           if [ -z "$ok" ]; then
             KKT=$(printf '%s' "$KK" | tr -d '\r\n ')
@@ -78,28 +82,30 @@ jobs:
               echo "::error::signing/kavi-release.jks.enc is missing. Upload the newest KaviWallet-Android.zip."
               exit 1
             fi
-            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$D/signing/kavi-release.jks.enc" -out "$F" -pass "pass:$KKT" 2>/dev/null; then
+            export KKT
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$D/signing/kavi-release.jks.enc" -out "$F" -pass env:KKT 2>/dev/null; then
               echo "::error::KAVI_KEYSTORE_KEY is wrong. Copy it again from 5-KAVI_KEYSTORE_KEY.txt (exactly 40 characters)."
               exit 1
             fi
             ok="key"
           fi
-          if ! keytool -list -keystore "$F" -storepass "$SPT" >/dev/null 2>&1; then
+          if ! keytool -list -keystore "$F" -storepass:env SPT >/dev/null 2>&1; then
             echo "::error::KAVI_KEYSTORE_PASSWORD is wrong. Copy it again from 1-KAVI_KEYSTORE_PASSWORD.txt."
             exit 1
           fi
-          if ! keytool -list -keystore "$F" -storepass "$SPT" -alias "$KAT" >/dev/null 2>&1; then
+          if ! keytool -list -keystore "$F" -storepass:env SPT -alias "$KAT" >/dev/null 2>&1; then
             echo "::error::KAVI_KEY_ALIAS is wrong. It must be exactly: the text in 2-KAVI_KEY_ALIAS.txt"
             exit 1
           fi
-          echo "Signing key ready (from $ok): $(keytool -list -v -keystore "$F" -storepass "$SPT" -alias "$KAT" | grep -m1 'SHA256:' | sed 's/.*SHA256: //')"
+          echo "Signing key ready (from $ok): $(keytool -list -v -keystore "$F" -storepass:env SPT -alias "$KAT" | grep -m1 'SHA256:' | sed 's/.*SHA256: //')"
           echo "KAVI_KEYSTORE_FILE=$F" >> "$GITHUB_ENV"
 
       - name: Add transaction history key
         env:
+          D: ${{ steps.proj.outputs.dir }}
           NK: ${{ secrets.KAVI_NODEREAL_KEY }}
         run: |
-          F="${{ steps.proj.outputs.dir }}/app/src/main/assets/www/wallet.js"
+          F="$D/app/src/main/assets/www/wallet.js"
           K=$(printf '%s' "$NK" | tr -d '\r\n ' | sed 's#.*/v1/##; s#/.*##')
           if [ -z "$K" ]; then
             echo "No KAVI_NODEREAL_KEY secret: token history will show Kavi Wallet transactions only."
@@ -129,8 +135,10 @@ jobs:
           gradle assembleRelease --no-daemon --stacktrace
 
       - name: Check APK signature
+        env:
+          D: ${{ steps.proj.outputs.dir }}
         run: |
-          A=$(find "${{ steps.proj.outputs.dir }}" -path '*/app/build/outputs/apk/release/*.apk' | grep -v unsigned | head -n 1)
+          A=$(find "$D" -path '*/app/build/outputs/apk/release/*.apk' | grep -v unsigned | head -n 1)
           if [ -z "$A" ]; then
             echo "::error::No signed APK was produced. Check that KAVI_KEY_PASSWORD matches 3-KAVI_KEY_PASSWORD.txt."
             find . -name '*.apk'
@@ -151,7 +159,7 @@ jobs:
           fi
           ls -la KaviWallet.apk
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: KaviWallet-apk
           path: KaviWallet.apk
